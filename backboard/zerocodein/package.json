@@ -1,0 +1,17 @@
+{
+	"name": "zerocodein",
+	"version": "0.1.0",
+	"private": true,
+	"license": "MIT",
+	"type": "module",
+	"description": "ZeroCodeIn orchestration layer — additive package over the Backboard fork. No upstream internals modified.",
+	"scripts": {
+		"test": "bun test tests/",
+		"demo": "bun run demo/e2e-demo.ts",
+		"typecheck": "tsc -p tsconfig.json"
+	},
+	"devDependencies": {
+		"typescript": "^5.9.0",
+		"@types/bun": "latest"
+	}
+}
