@@ -34,13 +34,25 @@ bun run typecheck
 bun run demo/e2e-demo.ts # full idea → plan → arch → parallel dev → merge → test
 ```
 
+## Worktree isolation
+
+Agent worktrees live **outside** the parent repository at
+`<repo-parent>/.zci-worktrees/<repo-name>-<hash>/<task-id>` — deterministic
+and collision-safe across same-named repos. The parent working tree stays
+clean with no `.gitignore` entries; git still tracks each worktree in
+`.git/worktrees` and `deleteWorktree` removes both the external directory and
+the registration.
+
 ## Untrusted agent output
 
-- Agent-supplied `testCommand`s are untrusted input. They are validated
-  (`testCommandError` rejects unsafe constructs) and require explicit user
-  approval — via `approve()`'s IDE prompt or `approveVerification()` — before
-  the orchestrator will execute them. Unapproved commands skip verification;
-  the task stays `merged` until approved or rejected.
+- Agent-supplied `testCommand`s are untrusted input under a **fail-closed
+  policy** (`parseVerificationCommand`): only allowlisted bare executables
+  with plain arguments — no shell, metacharacters, chaining, redirection,
+  substitution or paths. The user is shown the exact executable, arguments
+  and canonical working directory before approval; the approval is bound to
+  that exact tuple (`verifyApprovalKey`), so any later change invalidates it.
+  `IdeAdapter.ask` is fail-closed — missing answers, errors and timeouts all
+  count as denial.
 - Review diffs list every change: added, modified, deleted and renamed files
   (`DiffSummary.changes`, rename-aware via `git diff -M`).
 

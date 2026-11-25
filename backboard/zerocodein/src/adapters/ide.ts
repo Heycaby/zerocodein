@@ -26,8 +26,8 @@ export class ConsoleIdeAdapter implements IdeAdapter {
 		for (const [key, answer] of Object.entries(this.answers)) {
 			if (question.includes(key)) return answer;
 		}
-		// Headless default: affirmative for approvals so scripted flows complete;
-		// a real IDE impl prompts the human.
-		return "approve";
+		// FAIL CLOSED: no configured answer means denial, never implicit
+		// approval. Scripted flows must preload explicit answers.
+		return "deny";
 	}
 }

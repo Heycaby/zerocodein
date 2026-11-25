@@ -47,6 +47,7 @@ export interface Task {
 	resultCommit?: string;                       // merge commit hash, recorded as evidence
 	approvedBy?: string;
 	verifyApprovedBy?: string;               // who approved spec.testCommand for execution
+	verifyApprovalKey?: string;              // hash of exact exe+args+cwd approved — any change invalidates
 	mergeOrder?: number;
 	output?: string;                             // agent's structured output (plan/arch/notes)
 	error?: string;

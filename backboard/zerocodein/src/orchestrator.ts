@@ -2,6 +2,8 @@
 // assignments, approvals and agent lifecycle. Never writes repository content;
 // all repo writes go through the GitAdapter (A4). Runtime- and provider-agnostic.
 
+import { createHash } from "node:crypto";
+import { realpathSync, statSync } from "node:fs";
 import type {
 	AgentRuntimeAdapter,
 	ExecutionAdapter,
@@ -41,6 +43,32 @@ const ALLOWED: Readonly<Record<TaskStatus, readonly TaskStatus[]>> = {
 	done: [],
 };
 
+/** Fail-closed policy for agent-supplied verification commands.
+ *  Only allowlisted bare executable names with plain arguments may run —
+ *  no shell, no metacharacters, no paths. Configurable per installation. */
+export interface VerificationPolicy {
+	readonly allowedExecutables: readonly string[];
+	readonly maxCommandLength?: number;
+	readonly maxArgs?: number;
+}
+
+export const DEFAULT_VERIFICATION_POLICY: VerificationPolicy = {
+	allowedExecutables: [
+		"bun", "node", "npm", "npx", "pnpm", "yarn", "deno",
+		"python", "python3", "pytest", "uv",
+		"vitest", "jest", "mocha", "tsc", "eslint",
+		"cargo", "go", "make", "cmake",
+		"test", "true",
+	],
+	maxCommandLength: 500,
+	maxArgs: 32,
+};
+
+export interface VerificationCommand {
+	readonly executable: string;
+	readonly args: readonly string[];
+}
+
 export interface OrchestratorDeps {
 	readonly repoPath: string;          // protected parent repository
 	readonly git: GitAdapter;
@@ -51,6 +79,8 @@ export interface OrchestratorDeps {
 	readonly sink?: EventSink;
 	/** When true, merges require an explicit approve() call. Default true. */
 	readonly requireApproval?: boolean;
+	/** Verification command allowlist. Default: DEFAULT_VERIFICATION_POLICY. */
+	readonly verificationPolicy?: VerificationPolicy;
 }
 
 export interface TaskGraphEntry {
@@ -70,9 +100,11 @@ export class Orchestrator {
 	private readonly sessions = new Map<string, SessionHandle>();
 	private readonly log: OrchestratorEvent[] = [];
 	private readonly requireApproval: boolean;
+	private readonly policy: VerificationPolicy;
 
 	constructor(private readonly deps: OrchestratorDeps) {
 		this.requireApproval = deps.requireApproval ?? true;
+		this.policy = deps.verificationPolicy ?? DEFAULT_VERIFICATION_POLICY;
 	}
 
 	// ---- inspection ----
@@ -388,20 +420,36 @@ export class Orchestrator {
 	}
 
 	private async requestVerificationApproval(task: Task, approvedBy: string): Promise<void> {
-		const cmd = task.spec.testCommand!;
-		const unsafe = testCommandError(cmd);
-		if (unsafe) {
-			this.emit("verify:skipped", { taskId: task.id, data: { reason: `unsafe test command: ${unsafe}`, cmd } });
+		const raw = task.spec.testCommand!;
+		const parsed = parseVerificationCommand(raw, this.policy);
+		if ("error" in parsed) {
+			this.emit("verify:skipped", { taskId: task.id, data: { reason: `invalid test command: ${parsed.error}`, cmd: raw } });
 			return;
 		}
-		const verdict = (await this.deps.ide.ask(
-			`Task ${task.id} wants to run a post-merge test command:\n  ${cmd}\nApprove executing it?`,
-		)).trim().toLowerCase();
+		let cwd: string;
+		try {
+			cwd = resolveVerifyCwd(this.deps.repoPath);
+		} catch (e) {
+			this.emit("verify:skipped", { taskId: task.id, data: { reason: `cannot validate working directory: ${(e as Error).message}`, cmd: raw } });
+			return;
+		}
+		let verdict: string;
+		try {
+			verdict = (await this.deps.ide.ask(
+				`Task ${task.id} wants to run a post-merge test command:\n` +
+				`  cwd: ${cwd}\n  $ ${parsed.executable} ${parsed.args.join(" ")}\nApprove executing it?`,
+			)).trim().toLowerCase();
+		} catch {
+			// Prompt unavailable / timed out / adapter error — fail closed.
+			this.emit("verify:skipped", { taskId: task.id, data: { reason: "approval prompt unavailable", cmd: raw } });
+			return;
+		}
 		if (["approve", "approved", "yes", "y"].includes(verdict)) {
 			task.verifyApprovedBy = approvedBy;
-			this.emit("verify:approved", { taskId: task.id, data: { approvedBy, cmd } });
+			task.verifyApprovalKey = verificationKey(parsed, cwd);
+			this.emit("verify:approved", { taskId: task.id, data: { approvedBy, cmd: raw, cwd } });
 		} else {
-			this.emit("verify:skipped", { taskId: task.id, data: { reason: "user declined test command", cmd } });
+			this.emit("verify:skipped", { taskId: task.id, data: { reason: "user declined test command", cmd: raw } });
 		}
 	}
 
@@ -410,15 +458,17 @@ export class Orchestrator {
 	 *  verification immediately (resumable path from verify:skipped). */
 	async approveVerification(taskId: string, approvedBy = "user"): Promise<void> {
 		const task = this.mustGet(taskId);
-		const cmd = task.spec.testCommand;
-		if (!cmd) throw new Error(`task ${taskId} has no test command`);
-		const unsafe = testCommandError(cmd);
-		if (unsafe) throw new Error(`test command for ${taskId} rejected: ${unsafe}`);
+		const raw = task.spec.testCommand;
+		if (!raw) throw new Error(`task ${taskId} has no test command`);
+		const parsed = parseVerificationCommand(raw, this.policy);
+		if ("error" in parsed) throw new Error(`test command for ${taskId} rejected: ${parsed.error}`);
 		if (TERMINAL_STATES.has(task.status)) throw new Error(`task ${taskId} already ${task.status}`);
+		const cwd = resolveVerifyCwd(this.deps.repoPath);
 		task.verifyApprovedBy = approvedBy;
-		this.emit("verify:approved", { taskId: task.id, data: { approvedBy, cmd } });
+		task.verifyApprovalKey = verificationKey(parsed, cwd);
+		this.emit("verify:approved", { taskId: task.id, data: { approvedBy, cmd: raw, cwd } });
 		if (task.status === "merged") {
-			const ok = await this.verifyTask(task);
+			const ok = await this.verifyTask(task, parsed, cwd);
 			if (ok) this.refreshQueue();
 		}
 	}
@@ -443,19 +493,30 @@ export class Orchestrator {
 			this.transition(task, "merging");
 			await this.mergeTask(task);
 			if (task.spec.testCommand) {
-				const unsafe = testCommandError(task.spec.testCommand);
-				if (unsafe) {
-					this.emit("verify:skipped", { taskId: task.id, data: { reason: `unsafe test command: ${unsafe}` } });
-					this.transition(task, "failed", `unsafe test command: ${unsafe}`);
+				const parsed = parseVerificationCommand(task.spec.testCommand, this.policy);
+				if ("error" in parsed) {
+					this.emit("verify:skipped", { taskId: task.id, data: { reason: `invalid test command: ${parsed.error}` } });
+					this.transition(task, "failed", `invalid test command: ${parsed.error}`);
 					continue;
 				}
-				if (this.requireApproval && !task.verifyApprovedBy) {
+				let cwd: string;
+				try {
+					cwd = resolveVerifyCwd(this.deps.repoPath);
+				} catch (e) {
+					this.emit("verify:skipped", { taskId: task.id, data: { reason: `cannot validate working directory: ${(e as Error).message}` } });
+					this.transition(task, "failed", "verify working directory invalid");
+					continue;
+				}
+				// Approval is bound to the exact executable+args+cwd seen at
+				// approval time — any change to the command invalidates it.
+				const approved = task.verifyApprovalKey === verificationKey(parsed, cwd);
+				if (this.requireApproval && !approved) {
 					// Untrusted input: stays "merged" until approveVerification() runs it.
-					this.emit("verify:skipped", { taskId: task.id, data: { reason: "test command awaiting approval", cmd: task.spec.testCommand } });
+					this.emit("verify:skipped", { taskId: task.id, data: { reason: "test command not approved (or changed since approval)", cmd: task.spec.testCommand } });
 					this.refreshQueue();
 					continue;
 				}
-				const ok = await this.verifyTask(task);
+				const ok = await this.verifyTask(task, parsed, cwd);
 				if (!ok) continue; // verifyTask already transitioned to failed
 				done.push(task);
 				this.refreshQueue();
@@ -468,11 +529,17 @@ export class Orchestrator {
 		return done;
 	}
 
-	/** Run an approved testCommand post-merge; transitions merged→done or merged→failed. */
-	private async verifyTask(task: Task): Promise<boolean> {
-		const cmd = task.spec.testCommand!;
-		this.emit("verify:started", { taskId: task.id, data: { cmd } });
-		const ok = await this.runTestCommand(cmd);
+	/** Run an approved verification command post-merge; merged→done or merged→failed. */
+	private async verifyTask(task: Task, parsed: VerificationCommand, cwd: string): Promise<boolean> {
+		this.emit("verify:started", { taskId: task.id, data: { cmd: task.spec.testCommand, executable: parsed.executable, args: parsed.args, cwd } });
+		let ok = false;
+		try {
+			const proc = Bun.spawn([parsed.executable, ...parsed.args], { cwd, stdout: "pipe", stderr: "pipe" });
+			await proc.exited;
+			ok = proc.exitCode === 0;
+		} catch {
+			ok = false;
+		}
 		if (!ok) {
 			this.emit("verify:failed", { taskId: task.id });
 			this.transition(task, "failed", "post-merge test failed");
@@ -499,11 +566,7 @@ export class Orchestrator {
 		}
 	}
 
-	private async runTestCommand(cmd: string): Promise<boolean> {
-		const proc = Bun.spawn(["sh", "-c", cmd], { cwd: this.deps.repoPath, stdout: "pipe", stderr: "pipe" });
-		await proc.exited;
-		return proc.exitCode === 0;
-	}
+
 
 	private topoSort(tasks: readonly Task[]): Task[] {
 		const result: Task[] = [];
@@ -537,18 +600,53 @@ export class Orchestrator {
 	}
 }
 
-/** Reject obviously unsafe agent-supplied test commands. Returns a reason, or undefined if safe.
- *  Allowlist-style gating (the ide.ask approval) is the primary control;
- *  this is a fail-closed second layer for unambiguously dangerous input. */
-function testCommandError(cmd: string): string | undefined {
-	const c = cmd.trim();
-	if (c.length === 0) return "empty command";
-	if (c.length > 500) return "command too long";
-	if (/[\r\n]/.test(c)) return "multiline commands rejected";
-	if (/\b(sudo|doas|su)\b/.test(c)) return "privilege escalation rejected";
-	if (/\brm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+\//.test(c)) return "recursive delete from / rejected";
-	if (/\|\s*(sh|bash|zsh)\b/.test(c)) return "piped shell execution rejected";
-	if (/\b(curl|wget)\b[^|]*\|\s*\S*(sh|bash|zsh)/.test(c)) return "remote-script execution rejected";
-	if (/&\s*$/.test(c)) return "background processes rejected";
-	return undefined;
+// ---- verification command policy (fail-closed) ----
+
+// Any shell metacharacter or quoting/escape construct rejects the command —
+// plain "executable arg arg" only. Colon, equals, dash and dot are fine.
+const SHELL_META = /[;&|`$()<>{}\[\]*?!#~'"\\%^]/;
+
+/** Strictly parse an agent-supplied test command into executable + args.
+ *  No shell interpretation: whitespace-split only, allowlisted bare
+ *  executable names, no paths, no metacharacters. */
+export function parseVerificationCommand(
+	raw: string,
+	policy: VerificationPolicy = DEFAULT_VERIFICATION_POLICY,
+): VerificationCommand | { error: string } {
+	const c = raw.trim();
+	if (c.length === 0) return { error: "empty command" };
+	if (c.length > (policy.maxCommandLength ?? 500)) return { error: "command too long" };
+	if (/[\r\n\0]/.test(c)) return { error: "control characters rejected" };
+	if (SHELL_META.test(c)) {
+		return { error: "shell metacharacters rejected — plain executable + args only" };
+	}
+	const tokens = c.split(/\s+/);
+	const executable = tokens[0]!;
+	const args = tokens.slice(1);
+	if (executable.includes("/")) {
+		return { error: "executable must be an allowlisted name, not a path" };
+	}
+	if (!policy.allowedExecutables.includes(executable)) {
+		return { error: `executable "${executable}" not permitted` };
+	}
+	if (args.length > (policy.maxArgs ?? 32)) return { error: "too many arguments" };
+	return { executable, args };
+}
+
+/** Resolve the verification working directory. Must resolve to the real
+ *  project directory — realpath kills symlink games, traversal is impossible
+ *  since the command cannot specify a cwd. Throws when unverifiable. */
+export function resolveVerifyCwd(repoPath: string): string {
+	const real = realpathSync(repoPath);
+	if (!statSync(real).isDirectory()) {
+		throw new Error("verify cwd is not a directory");
+	}
+	return real;
+}
+
+/** Approval binds to the EXACT executable+args+cwd — any change invalidates. */
+export function verificationKey(cmd: VerificationCommand, cwd: string): string {
+	return createHash("sha256")
+		.update([cmd.executable, ...cmd.args, "", cwd].join("\x00"))
+		.digest("hex");
 }
