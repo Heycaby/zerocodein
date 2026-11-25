@@ -38,6 +38,23 @@ function defaultWorktreeRoot(repoPath: string): string {
 	return join(dirname(repoPath), ".zci-worktrees", key);
 }
 
+/** Worktree names become both a filesystem path segment and a git ref
+ *  component (zci/<name>) — validate before either is constructed. */
+export function validateWorktreeName(name: string): void {
+	if (!name || name.length > 128) {
+		throw new Error(`invalid worktree name "${name}"`);
+	}
+	if (name !== basename(name) || name.includes("\\")) {
+		throw new Error(`worktree name must not contain path separators: "${name}"`);
+	}
+	if (name.startsWith(".") || name.startsWith("-") || name.includes("..")) {
+		throw new Error(`unsafe worktree name "${name}"`);
+	}
+	if (!/^[A-Za-z0-9._-]+$/.test(name)) {
+		throw new Error(`worktree name has unsafe characters: "${name}"`);
+	}
+}
+
 export class RealGitAdapter implements GitAdapter {
 	/** Optional override for the worktree root (tests, managed installs). */
 	constructor(private readonly worktreeRoot: (repoPath: string) => string = defaultWorktreeRoot) {}
@@ -47,6 +64,7 @@ export class RealGitAdapter implements GitAdapter {
 		name: string,
 		baseRef = "HEAD",
 	): Promise<WorktreeInfo> {
+		validateWorktreeName(name);
 		const branch = `zci/${name}`;
 		const path = join(this.worktreeRoot(repoPath), name);
 		mkdirSync(dirname(path), { recursive: true });
