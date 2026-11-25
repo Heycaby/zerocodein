@@ -43,23 +43,44 @@ const ALLOWED: Readonly<Record<TaskStatus, readonly TaskStatus[]>> = {
 	done: [],
 };
 
+/** Per-executable rule in the verification policy. */
+export interface ExecutableRule {
+	/** If set, the first argument must be one of these literal subcommands —
+	 *  e.g. `bun` only for `bun test`, never `bun run` or `bun <file>`. */
+	readonly firstArg?: readonly string[];
+	/** Arguments that are never permitted — interpreter/shell escapes like
+	 *  `node -e`, `python -c`, `python -m`. */
+	readonly deniedArgs?: readonly string[];
+}
+
 /** Fail-closed policy for agent-supplied verification commands.
- *  Only allowlisted bare executable names with plain arguments may run —
- *  no shell, no metacharacters, no paths. Configurable per installation. */
+ *  Only allowlisted executable+argument-shape combinations may run —
+ *  no shell, no metacharacters, no paths, no script launchers.
+ *  Configurable per installation. */
 export interface VerificationPolicy {
-	readonly allowedExecutables: readonly string[];
+	readonly executables: Readonly<Record<string, ExecutableRule>>;
 	readonly maxCommandLength?: number;
 	readonly maxArgs?: number;
 }
 
 export const DEFAULT_VERIFICATION_POLICY: VerificationPolicy = {
-	allowedExecutables: [
-		"bun", "node", "npm", "npx", "pnpm", "yarn", "deno",
-		"python", "python3", "pytest", "uv",
-		"vitest", "jest", "mocha", "tsc", "eslint",
-		"cargo", "go", "make", "cmake",
-		"test", "true",
-	],
+	executables: {
+		"test": {},
+		"true": {},
+		"bun": { firstArg: ["test"] },
+		"deno": { firstArg: ["test", "check", "lint"] },
+		"vitest": {},
+		"jest": {},
+		"mocha": {},
+		"pytest": {},
+		"tsc": {},
+		"eslint": {},
+		"go": { firstArg: ["test", "vet", "build"] },
+		"cargo": { firstArg: ["test", "check", "clippy", "build"] },
+		"node": { deniedArgs: ["-e", "--eval", "-p", "--print", "-i", "--interactive", "--inspect", "--inspect-brk"] },
+		"python": { deniedArgs: ["-c", "-m", "-i"] },
+		"python3": { deniedArgs: ["-c", "-m", "-i"] },
+	},
 	maxCommandLength: 500,
 	maxArgs: 32,
 };
@@ -626,8 +647,15 @@ export function parseVerificationCommand(
 	if (executable.includes("/")) {
 		return { error: "executable must be an allowlisted name, not a path" };
 	}
-	if (!policy.allowedExecutables.includes(executable)) {
+	const rule = policy.executables[executable];
+	if (!rule) {
 		return { error: `executable "${executable}" not permitted` };
+	}
+	if (rule.firstArg && !rule.firstArg.includes(args[0] ?? "")) {
+		return { error: `"${executable}" is only permitted as ${rule.firstArg.map((a) => `${executable} ${a}`).join(" | ")}` };
+	}
+	if (rule.deniedArgs?.some((d) => args.includes(d))) {
+		return { error: `"${executable}" with ${rule.deniedArgs.filter((d) => args.includes(d)).join(", ")} is not permitted` };
 	}
 	if (args.length > (policy.maxArgs ?? 32)) return { error: "too many arguments" };
 	return { executable, args };

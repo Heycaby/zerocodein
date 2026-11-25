@@ -556,12 +556,49 @@ describe("verification command policy — fail-closed", () => {
 		}
 	});
 
-	it("policy accepts allowlisted executable + plain args", async () => {
-		const p = parseVerificationCommand("npm run test:unit");
-		expect("error" in p).toBe(false);
+	it("policy rejects script launchers and interpreter escapes", async () => {
+		for (const bad of [
+			"npm run test:unit",   // project scripts are arbitrary code
+			"npm test",
+			"npm install",
+			"bun run build",
+			"bun server.js",
+			"python -m pytest",
+			"python -c 'import os'",
+			"python3 -c print(1)",
+			"node -e console.log(1)",
+			"node --eval 'x'",
+			"npx vitest",
+			"pnpm test",
+			"yarn test",
+			"make test",
+			"uv run pytest",
+		]) {
+			const p = parseVerificationCommand(bad);
+			expect("error" in p, `"${bad}" should be rejected`).toBe(true);
+		}
+	});
+
+	it("policy accepts allowlisted executable + arg combinations", async () => {
+		for (const [cmd, exe] of [
+			["test -f ui.js", "test"],
+			["bun test", "bun"],
+			["bun test tests/orchestrator.test.ts", "bun"],
+			["vitest run --reporter=dot", "vitest"],
+			["pytest tests/ -q", "pytest"],
+			["tsc --noEmit", "tsc"],
+			["node test.js", "node"],
+			["go test ./...", "go"],
+			["cargo test --workspace", "cargo"],
+		] as const) {
+			const p = parseVerificationCommand(cmd);
+			expect("error" in p, `"${cmd}" should be accepted`).toBe(false);
+			if (!("error" in p)) expect(p.executable).toBe(exe);
+		}
+		const p = parseVerificationCommand("vitest run --reporter=dot");
 		if (!("error" in p)) {
-			expect(p.executable).toBe("npm");
-			expect(p.args).toEqual(["run", "test:unit"]);
+			expect(p.executable).toBe("vitest");
+			expect(p.args).toEqual(["run", "--reporter=dot"]);
 		}
 	});
 
@@ -573,7 +610,7 @@ describe("verification command policy — fail-closed", () => {
 			repoPath: repo, git: new RealGitAdapter(), runtime,
 			providers: new ConfigModelProvider(DEFAULT_PROVIDER_CONFIG), ide,
 			execution: new ExecutionAdapterImpl(runtime),
-			verificationPolicy: { allowedExecutables: ["true"] },
+			verificationPolicy: { executables: { "true": {} } },
 		});
 		const t = orch.createTask({
 			title: "x", role: "frontend-dev",
@@ -848,5 +885,31 @@ describe("fail-closed approval adapter", () => {
 			await orch.approve(t.id, "cto");
 			expect(orch.getTask(t.id)!.verifyApprovalKey, `answer ${a}`).toBeDefined();
 		}
+	});
+});
+
+describe("worktree name validation", () => {
+	it("rejects traversal, separators, absolute paths and unsafe names", async () => {
+		const { repo } = fixture();
+		const git = new RealGitAdapter();
+		for (const bad of [
+			"..", "../escape", "a/b", "a\\b", "/abs/path", ".hidden",
+			"", "with space", "semi;colon", "tick`x", "a$b", "star*",
+			"quest?", "colon:name", "-lead",
+		]) {
+			await expect(git.createWorktree(repo, bad)).rejects.toThrow();
+		}
+		// nothing was created — parent stays clean
+		const status = Bun.spawnSync(["git", "-C", repo, "status", "--porcelain"]).stdout.toString();
+		expect(status.trim()).toBe("");
+	});
+
+	it("accepts ordinary task-style names", async () => {
+		const { repo } = fixture();
+		const git = new RealGitAdapter();
+		const wt = await git.createWorktree(repo, "task_001");
+		expect(wt.path.endsWith("task_001")).toBe(true);
+		expect(wt.branch).toBe("zci/task_001");
+		await git.deleteWorktree(repo, wt);
 	});
 });

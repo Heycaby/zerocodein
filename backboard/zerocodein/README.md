@@ -46,13 +46,19 @@ the registration.
 ## Untrusted agent output
 
 - Agent-supplied `testCommand`s are untrusted input under a **fail-closed
-  policy** (`parseVerificationCommand`): only allowlisted bare executables
-  with plain arguments — no shell, metacharacters, chaining, redirection,
-  substitution or paths. The user is shown the exact executable, arguments
-  and canonical working directory before approval; the approval is bound to
-  that exact tuple (`verifyApprovalKey`), so any later change invalidates it.
-  `IdeAdapter.ask` is fail-closed — missing answers, errors and timeouts all
-  count as denial.
+  policy** (`parseVerificationCommand`): per-executable rules require a fixed
+  subcommand (`bun test`, `go test`, `cargo test`) or deny interpreter escapes
+  (`node -e`, `python -c`/`-m`). Script launchers — `npm`/`npx`/`pnpm`/`yarn`,
+  `bun run`, `make`, `uv run` — are not permitted: allowed commands run a
+  named binary with plain args, no project scripts. No shell, metacharacters,
+  chaining, redirection, substitution or paths. The user is shown the exact
+  executable, arguments and canonical working directory before approval; the
+  approval is bound to that exact tuple (`verifyApprovalKey`), so any later
+  change invalidates it. `IdeAdapter.ask` is fail-closed — missing answers,
+  errors and timeouts all count as denial.
+- Worktree names are validated (`validateWorktreeName`) before the filesystem
+  path or `zci/<name>` ref is constructed — no traversal, separators,
+  absolute paths or unsafe characters.
 - Review diffs list every change: added, modified, deleted and renamed files
   (`DiffSummary.changes`, rename-aware via `git diff -M`).
 
