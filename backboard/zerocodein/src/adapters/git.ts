@@ -3,6 +3,7 @@
 
 import type {
 	DiffSummary,
+	FileChange,
 	GitAdapter,
 	MergeResult,
 	WorktreeInfo,
@@ -40,7 +41,8 @@ export class RealGitAdapter implements GitAdapter {
 
 	async getDiff(worktreePath: string, baseRef: string): Promise<DiffSummary> {
 		// Everything the agent changed vs the worktree's base — committed or not.
-		const patch = await git(worktreePath, ["diff", baseRef]);
+		// -M enables rename detection so renames appear as such, not delete+add.
+		const patch = await git(worktreePath, ["diff", "-M", baseRef]);
 		const status = await git(worktreePath, ["status", "--porcelain"]);
 		const newFiles = status
 			.split("\n")
@@ -53,11 +55,25 @@ export class RealGitAdapter implements GitAdapter {
 		const del = /(\d+) deletion/.exec(stat);
 		if (ins?.[1]) insertions = parseInt(ins[1], 10);
 		if (del?.[1]) deletions = parseInt(del[1], 10);
-		const tracked = await git(worktreePath, [
-			"diff", "--name-only", baseRef,
+		const changes: FileChange[] = [];
+		const nameStatus = await git(worktreePath, [
+			"diff", "--name-status", "-M", baseRef,
 		]).catch(() => "");
-		const filesChanged = tracked.split("\n").filter(Boolean).length + newFiles.length;
-		return { filesChanged, insertions, deletions, patch, newFiles };
+		for (const line of nameStatus.split("\n").filter(Boolean)) {
+			const [code, ...paths] = line.split("\t");
+			const first = paths[0] ?? "";
+			if (code?.startsWith("R")) {
+				changes.push({ status: "renamed", path: paths[1] ?? first, oldPath: first });
+			} else if (code === "A") {
+				changes.push({ status: "added", path: first });
+			} else if (code === "D") {
+				changes.push({ status: "deleted", path: first });
+			} else {
+				changes.push({ status: "modified", path: first });
+			}
+		}
+		const filesChanged = new Set([...changes.map((c) => c.path), ...newFiles]).size;
+		return { filesChanged, insertions, deletions, patch, newFiles, changes };
 	}
 
 	async commitAll(worktreePath: string, message: string): Promise<string> {

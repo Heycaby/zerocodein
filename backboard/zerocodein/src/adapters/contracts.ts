@@ -63,12 +63,20 @@ export interface WorktreeInfo {
 	readonly baseRef: string;           // parent commit the worktree branched from
 }
 
+export interface FileChange {
+	readonly status: "added" | "modified" | "deleted" | "renamed";
+	readonly path: string;
+	readonly oldPath?: string;          // set when status === "renamed"
+}
+
 export interface DiffSummary {
 	readonly filesChanged: number;
 	readonly insertions: number;
 	readonly deletions: number;
-	readonly patch: string;             // full diff text for review
+	readonly patch: string;             // full diff text for review (rename-aware)
 	readonly newFiles: readonly string[];
+	/** Per-file change list — added, modified, deleted and renamed are all represented. */
+	readonly changes: readonly FileChange[];
 }
 
 export interface MergeResult {
