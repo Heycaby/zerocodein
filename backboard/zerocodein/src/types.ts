@@ -46,6 +46,7 @@ export interface Task {
 	diffSummary?: string;
 	resultCommit?: string;                       // merge commit hash, recorded as evidence
 	approvedBy?: string;
+	verifyApprovedBy?: string;               // who approved spec.testCommand for execution
 	mergeOrder?: number;
 	output?: string;                             // agent's structured output (plan/arch/notes)
 	error?: string;
@@ -79,7 +80,7 @@ export type EventType =
 	| "worktree:created" | "worktree:removed"
 	| "diff:ready" | "approval:requested" | "approval:granted" | "approval:denied"
 	| "merge:started" | "merge:completed" | "merge:failed"
-	| "verify:started" | "verify:passed" | "verify:failed"
+	| "verify:started" | "verify:passed" | "verify:failed" | "verify:approved" | "verify:skipped"
 	| "idea:submitted" | "plan:approved" | "graph:materialized";
 
 export interface OrchestratorEvent {

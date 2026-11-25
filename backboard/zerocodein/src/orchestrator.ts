@@ -8,6 +8,7 @@ import type {
 	GitAdapter,
 	IdeAdapter,
 	ModelProviderAdapter,
+	SessionHandle,
 	SessionSpec,
 	WorktreeInfo,
 } from "./adapters/contracts.ts";
@@ -26,10 +27,10 @@ import { getAgent } from "./registry.ts";
 const ALLOWED: Readonly<Record<TaskStatus, readonly TaskStatus[]>> = {
 	draft: ["planned", "cancelled"],
 	planned: ["queued", "cancelled"],
-	queued: ["assigned", "cancelled"],
+	queued: ["assigned", "failed", "cancelled"],
 	assigned: ["running", "failed", "cancelled"],
 	running: ["review", "failed", "blocked", "cancelled"],
-	review: ["approved", "rejected", "blocked"],
+	review: ["approved", "rejected", "blocked", "cancelled"],
 	approved: ["merging", "cancelled"],
 	merging: ["merged", "blocked"],
 	merged: ["done", "failed"],
@@ -66,6 +67,7 @@ let seq = 0;
 export class Orchestrator {
 	private readonly tasks = new Map<string, Task>();
 	private readonly worktrees = new Map<string, WorktreeInfo>();
+	private readonly sessions = new Map<string, SessionHandle>();
 	private readonly log: OrchestratorEvent[] = [];
 	private readonly requireApproval: boolean;
 
@@ -88,9 +90,10 @@ export class Orchestrator {
 		if (!ALLOWED[task.status].includes(to)) {
 			throw new Error(`illegal transition ${task.status} -> ${to} for task ${task.id}`);
 		}
+		const from = task.status;
 		task.status = to;
 		task.statusReason = reason;
-		this.emit("task:transition", { taskId: task.id, agentRole: task.role, data: { from: task.status, to, reason } });
+		this.emit("task:transition", { taskId: task.id, agentRole: task.role, data: { from, to, reason } });
 	}
 
 	// ---- task lifecycle ----
@@ -124,11 +127,14 @@ export class Orchestrator {
 	}
 
 	private wouldCycle(id: string, deps: readonly string[]): boolean {
-		const seen = new Set<string>([id]);
+		// A cycle exists only if some dep's transitive closure reaches `id`
+		// itself — revisiting a shared ancestor (diamond) is not a cycle.
 		const stack = [...deps];
+		const seen = new Set<string>();
 		while (stack.length) {
 			const cur = stack.pop()!;
-			if (seen.has(cur)) return true;
+			if (cur === id) return true;
+			if (seen.has(cur)) continue;
 			seen.add(cur);
 			stack.push(...(this.tasks.get(cur)?.dependsOn ?? []));
 		}
@@ -187,19 +193,27 @@ export class Orchestrator {
 		return arch;
 	}
 
-	/** After the architect runs, materialize its TASKS.json into dev tasks. */
+	/** After the architect runs, materialize its TASKS.json into dev tasks.
+	 *  Two passes: first parse + validate the WHOLE graph (ids, roles, dep
+	 *  references, duplicates, cycles) — create nothing on failure. Then create
+	 *  tasks in topological order via an architect-id → task-id map, so input
+	 *  order and forward references don't matter. */
 	async materializeGraph(archTaskId: string): Promise<readonly Task[]> {
 		const arch = this.mustGet(archTaskId);
 		if (arch.status !== "review") throw new Error(`architect task ${archTaskId} not in review`);
 		const wt = this.worktrees.get(arch.id);
 		if (!wt) throw new Error("architect worktree missing");
 		const raw = await Bun.file(`${wt.path}/TASKS.json`).text();
-		const entries = JSON.parse(raw) as TaskGraphEntry[];
+		const entries = this.parseTaskGraph(raw);
+		const order = this.topoGraphEntries(entries);
+
+		const idMap = new Map<string, string>(); // architect id → orchestrator task id
 		const created: Task[] = [];
-		for (const e of entries) {
+		for (const e of order) {
 			const mapped = (e.dependsOn ?? []).map((d) => {
-				const t = created.find((c) => c.id === `task_${d}` || c.title === d);
-				return t?.id ?? `task_${d}`;
+				const mid = idMap.get(d);
+				if (!mid) throw new Error(`internal: dep ${d} not yet materialized`);
+				return mid;
 			});
 			const t = this.createTask({
 				title: e.title,
@@ -207,10 +221,61 @@ export class Orchestrator {
 				spec: { prompt: e.prompt, context: arch.output, testCommand: e.testCommand },
 				dependsOn: [arch.id, ...mapped],
 			});
+			idMap.set(e.id, t.id);
 			created.push(t);
 		}
-		this.emit("graph:materialized", { data: { count: created.length } });
+		this.emit("graph:materialized", {
+			data: { count: created.length, idMap: Object.fromEntries(idMap) },
+		});
 		return created;
+	}
+
+	private parseTaskGraph(raw: string): TaskGraphEntry[] {
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(raw);
+		} catch {
+			throw new Error("architect TASKS.json is not valid JSON");
+		}
+		if (!Array.isArray(parsed) || parsed.length === 0) {
+			throw new Error("TASKS.json must be a non-empty array of tasks");
+		}
+		const entries = parsed as TaskGraphEntry[];
+		const ids = new Set<string>();
+		const roles = new Set<AgentRole>(["pm", "architect", "frontend-dev", "backend-dev"]);
+		for (const e of entries) {
+			if (!e || typeof e.id !== "string" || e.id.length === 0) {
+				throw new Error("every task entry needs a non-empty string id");
+			}
+			if (ids.has(e.id)) throw new Error(`duplicate task id "${e.id}" in TASKS.json`);
+			ids.add(e.id);
+			if (!roles.has(e.role)) throw new Error(`task "${e.id}" has unknown role "${e.role}"`);
+			if (!e.title || !e.prompt) throw new Error(`task "${e.id}" needs title and prompt`);
+		}
+		for (const e of entries) {
+			for (const d of e.dependsOn ?? []) {
+				if (!ids.has(d)) throw new Error(`task "${e.id}" depends on unknown task "${d}"`);
+			}
+		}
+		return entries;
+	}
+
+	/** Topological order over architect ids; throws on cycles. */
+	private topoGraphEntries(entries: readonly TaskGraphEntry[]): TaskGraphEntry[] {
+		const byId = new Map(entries.map((e) => [e.id, e]));
+		const state = new Map<string, number>(); // 1 = visiting, 2 = done
+		const order: TaskGraphEntry[] = [];
+		const visit = (id: string, stack: string[]): void => {
+			const s = state.get(id);
+			if (s === 2) return;
+			if (s === 1) throw new Error(`dependency cycle: ${[...stack, id].join(" -> ")}`);
+			state.set(id, 1);
+			for (const d of byId.get(id)?.dependsOn ?? []) visit(d, [...stack, id]);
+			state.set(id, 2);
+			order.push(byId.get(id)!);
+		};
+		for (const e of entries) visit(e.id, []);
+		return order;
 	}
 
 	// ---- execution ----
@@ -240,28 +305,30 @@ export class Orchestrator {
 		}
 		const agent = getAgent(task.role);
 		// RULE: agents never see the parent repo path — only their worktree.
-		const wt = await this.deps.git.createWorktree(this.deps.repoPath, task.id);
-		this.worktrees.set(task.id, wt);
-		task.worktreePath = wt.path;
-		task.branch = wt.branch;
-		this.emit("worktree:created", { taskId: task.id, data: { path: wt.path, branch: wt.branch } });
-
-		const spec: SessionSpec = {
-			worktreePath: wt.path,
-			role: task.role,
-			prompt: this.renderPrompt(task),
-			model: this.deps.providers.resolve(agent.taskClass, task.role),
-			permissionMode: agent.permissionMode,
-		};
-		const handle = await this.deps.execution.dispatch(spec, "local");
-		task.assignedSession = handle.id;
-		this.transition(task, "assigned");
-		this.emit("agent:assigned", { taskId: task.id, agentRole: task.role, data: { session: handle.id, model: spec.model } });
-		this.transition(task, "running");
-
+		let wt: WorktreeInfo | undefined;
 		try {
+			wt = await this.deps.git.createWorktree(this.deps.repoPath, task.id);
+			this.worktrees.set(task.id, wt);
+			task.worktreePath = wt.path;
+			task.branch = wt.branch;
+			this.emit("worktree:created", { taskId: task.id, data: { path: wt.path, branch: wt.branch } });
+
+			const spec: SessionSpec = {
+				worktreePath: wt.path,
+				role: task.role,
+				prompt: this.renderPrompt(task),
+				model: this.deps.providers.resolve(agent.taskClass, task.role),
+				permissionMode: agent.permissionMode,
+			};
+			const handle = await this.deps.execution.dispatch(spec, "local");
+			this.sessions.set(task.id, handle);
+			task.assignedSession = handle.id;
+			this.transition(task, "assigned");
+			this.emit("agent:assigned", { taskId: task.id, agentRole: task.role, data: { session: handle.id, model: spec.model } });
+			this.transition(task, "running");
+
 			const outputParts: string[] = [];
-			for await (const ev of this.deps.runtime.run(handle as never)) {
+			for await (const ev of this.deps.runtime.run(handle)) {
 				this.emit("agent:event", { taskId: task.id, agentRole: task.role, data: { type: ev.type, tool: ev.toolName } });
 				if (ev.type === "error") throw new Error(ev.error ?? "agent error");
 				if (ev.type === "tool:result" && ev.output) outputParts.push(ev.output);
@@ -271,14 +338,24 @@ export class Orchestrator {
 			await this.deps.git.commitAll(wt.path, `zerocodein(${task.role}): ${task.title}`);
 			const diff = await this.deps.git.getDiff(wt.path, wt.baseRef);
 			task.diffSummary = `${diff.filesChanged} files, +${diff.insertions}/-${diff.deletions}`;
-			this.emit("diff:ready", { taskId: task.id, data: { summary: task.diffSummary, newFiles: diff.newFiles } });
+			this.emit("diff:ready", { taskId: task.id, data: { summary: task.diffSummary, newFiles: diff.newFiles, changes: diff.changes } });
 			this.emit("agent:completed", { taskId: task.id, agentRole: task.role });
 			this.transition(task, "review");
 			this.refreshQueue();
 		} catch (e) {
 			task.error = (e as Error).message;
 			this.emit("agent:failed", { taskId: task.id, agentRole: task.role, data: { error: task.error } });
-			this.transition(task, "failed", task.error);
+			// Re-read via the map: task.status above is narrowed to "queued" by the
+			// runnability guard, and cancel() may have raced us to "cancelled".
+			if (this.tasks.get(task.id)!.status !== "cancelled") {
+				this.transition(task, "failed", task.error);
+			}
+			this.sessions.delete(task.id);
+			if (wt) {
+				await this.deps.git.deleteWorktree(this.deps.repoPath, wt).catch(() => {});
+				this.worktrees.delete(task.id);
+				this.emit("worktree:removed", { taskId: task.id });
+			}
 		}
 	}
 
@@ -291,7 +368,9 @@ export class Orchestrator {
 
 	// ---- review / approval / merge ----
 
-	/** User reviews and approves a task's diff. Records the approver. */
+	/** User reviews and approves a task's diff. Records the approver.
+	 *  If the task carries an agent-supplied testCommand, the user is asked
+	 *  to approve that specific command — it is untrusted input. */
 	async approve(taskId: string, approvedBy = "user"): Promise<void> {
 		const task = this.mustGet(taskId);
 		if (task.status !== "review") throw new Error(`task ${taskId} not awaiting review (${task.status})`);
@@ -302,7 +381,46 @@ export class Orchestrator {
 		this.emit("approval:requested", { taskId: task.id });
 		this.transition(task, "approved");
 		task.approvedBy = approvedBy;
+		if (task.spec.testCommand) {
+			await this.requestVerificationApproval(task, approvedBy);
+		}
 		this.emit("approval:granted", { taskId: task.id, data: { approvedBy } });
+	}
+
+	private async requestVerificationApproval(task: Task, approvedBy: string): Promise<void> {
+		const cmd = task.spec.testCommand!;
+		const unsafe = testCommandError(cmd);
+		if (unsafe) {
+			this.emit("verify:skipped", { taskId: task.id, data: { reason: `unsafe test command: ${unsafe}`, cmd } });
+			return;
+		}
+		const verdict = (await this.deps.ide.ask(
+			`Task ${task.id} wants to run a post-merge test command:\n  ${cmd}\nApprove executing it?`,
+		)).trim().toLowerCase();
+		if (["approve", "approved", "yes", "y"].includes(verdict)) {
+			task.verifyApprovedBy = approvedBy;
+			this.emit("verify:approved", { taskId: task.id, data: { approvedBy, cmd } });
+		} else {
+			this.emit("verify:skipped", { taskId: task.id, data: { reason: "user declined test command", cmd } });
+		}
+	}
+
+	/** Explicit approval for a task's testCommand — for tasks whose command
+	 *  wasn't approved during approve(). If the task is already merged, runs
+	 *  verification immediately (resumable path from verify:skipped). */
+	async approveVerification(taskId: string, approvedBy = "user"): Promise<void> {
+		const task = this.mustGet(taskId);
+		const cmd = task.spec.testCommand;
+		if (!cmd) throw new Error(`task ${taskId} has no test command`);
+		const unsafe = testCommandError(cmd);
+		if (unsafe) throw new Error(`test command for ${taskId} rejected: ${unsafe}`);
+		if (TERMINAL_STATES.has(task.status)) throw new Error(`task ${taskId} already ${task.status}`);
+		task.verifyApprovedBy = approvedBy;
+		this.emit("verify:approved", { taskId: task.id, data: { approvedBy, cmd } });
+		if (task.status === "merged") {
+			const ok = await this.verifyTask(task);
+			if (ok) this.refreshQueue();
+		}
 	}
 
 	async reject(taskId: string, reason: string, rejectedBy = "user"): Promise<void> {
@@ -325,20 +443,44 @@ export class Orchestrator {
 			this.transition(task, "merging");
 			await this.mergeTask(task);
 			if (task.spec.testCommand) {
-				this.emit("verify:started", { taskId: task.id, data: { cmd: task.spec.testCommand } });
-				const ok = await this.runTestCommand(task.spec.testCommand);
-				if (!ok) {
-					this.emit("verify:failed", { taskId: task.id });
-					this.transition(task, "failed", "post-merge test failed");
+				const unsafe = testCommandError(task.spec.testCommand);
+				if (unsafe) {
+					this.emit("verify:skipped", { taskId: task.id, data: { reason: `unsafe test command: ${unsafe}` } });
+					this.transition(task, "failed", `unsafe test command: ${unsafe}`);
 					continue;
 				}
-				this.emit("verify:passed", { taskId: task.id });
+				if (this.requireApproval && !task.verifyApprovedBy) {
+					// Untrusted input: stays "merged" until approveVerification() runs it.
+					this.emit("verify:skipped", { taskId: task.id, data: { reason: "test command awaiting approval", cmd: task.spec.testCommand } });
+					this.refreshQueue();
+					continue;
+				}
+				const ok = await this.verifyTask(task);
+				if (!ok) continue; // verifyTask already transitioned to failed
+				done.push(task);
+				this.refreshQueue();
+				continue;
 			}
 			this.transition(task, "done");
 			done.push(task);
 			this.refreshQueue();
 		}
 		return done;
+	}
+
+	/** Run an approved testCommand post-merge; transitions merged→done or merged→failed. */
+	private async verifyTask(task: Task): Promise<boolean> {
+		const cmd = task.spec.testCommand!;
+		this.emit("verify:started", { taskId: task.id, data: { cmd } });
+		const ok = await this.runTestCommand(cmd);
+		if (!ok) {
+			this.emit("verify:failed", { taskId: task.id });
+			this.transition(task, "failed", "post-merge test failed");
+			return false;
+		}
+		this.emit("verify:passed", { taskId: task.id });
+		this.transition(task, "done");
+		return true;
 	}
 
 	private async mergeTask(task: Task): Promise<void> {
@@ -382,6 +524,31 @@ export class Orchestrator {
 	async cancel(taskId: string): Promise<void> {
 		const task = this.mustGet(taskId);
 		if (TERMINAL_STATES.has(task.status)) throw new Error(`task ${taskId} already ${task.status}`);
+		const handle = this.sessions.get(taskId);
+		if (handle) await this.deps.runtime.terminate(handle).catch(() => {});
+		this.sessions.delete(taskId);
+		const wt = this.worktrees.get(taskId);
+		if (wt) {
+			await this.deps.git.deleteWorktree(this.deps.repoPath, wt);
+			this.worktrees.delete(taskId);
+			this.emit("worktree:removed", { taskId });
+		}
 		this.transition(task, "cancelled", "user cancelled");
 	}
+}
+
+/** Reject obviously unsafe agent-supplied test commands. Returns a reason, or undefined if safe.
+ *  Allowlist-style gating (the ide.ask approval) is the primary control;
+ *  this is a fail-closed second layer for unambiguously dangerous input. */
+function testCommandError(cmd: string): string | undefined {
+	const c = cmd.trim();
+	if (c.length === 0) return "empty command";
+	if (c.length > 500) return "command too long";
+	if (/[\r\n]/.test(c)) return "multiline commands rejected";
+	if (/\b(sudo|doas|su)\b/.test(c)) return "privilege escalation rejected";
+	if (/\brm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+\//.test(c)) return "recursive delete from / rejected";
+	if (/\|\s*(sh|bash|zsh)\b/.test(c)) return "piped shell execution rejected";
+	if (/\b(curl|wget)\b[^|]*\|\s*\S*(sh|bash|zsh)/.test(c)) return "remote-script execution rejected";
+	if (/&\s*$/.test(c)) return "background processes rejected";
+	return undefined;
 }
