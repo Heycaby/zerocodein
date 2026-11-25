@@ -1,6 +1,9 @@
 // A4 Git adapter — real implementation over the git CLI.
 // This adapter is the ONLY writer of repository state in the system.
 
+import { createHash } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import type {
 	DiffSummary,
 	FileChange,
@@ -26,14 +29,27 @@ async function git(cwd: string, args: string[]): Promise<string> {
 	return out.trim();
 }
 
+/** Root for all agent worktrees of a repo — OUTSIDE the repository so the
+ *  parent stays clean without .gitignore hacks. Deterministic:
+ *  <repo-parent>/.zci-worktrees/<repoName>-<hash(repoPath)>, collision-safe
+ *  for same-named repos in different locations. */
+function defaultWorktreeRoot(repoPath: string): string {
+	const key = `${basename(repoPath)}-${createHash("sha256").update(repoPath).digest("hex").slice(0, 12)}`;
+	return join(dirname(repoPath), ".zci-worktrees", key);
+}
+
 export class RealGitAdapter implements GitAdapter {
+	/** Optional override for the worktree root (tests, managed installs). */
+	constructor(private readonly worktreeRoot: (repoPath: string) => string = defaultWorktreeRoot) {}
+
 	async createWorktree(
 		repoPath: string,
 		name: string,
 		baseRef = "HEAD",
 	): Promise<WorktreeInfo> {
 		const branch = `zci/${name}`;
-		const path = `${repoPath}/.zci-worktrees/${name}`;
+		const path = join(this.worktreeRoot(repoPath), name);
+		mkdirSync(dirname(path), { recursive: true });
 		const base = await git(repoPath, ["rev-parse", baseRef]);
 		await git(repoPath, ["worktree", "add", path, "-b", branch, base]);
 		return { path, branch, baseRef: base };
