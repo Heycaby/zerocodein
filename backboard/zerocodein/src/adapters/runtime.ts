@@ -22,9 +22,12 @@ interface NdjsonEvent {
 	};
 }
 
-/** Minimal process surface run() needs — injectable for tests. */
+/** Minimal process surface run() needs — injectable for tests.
+ *  Contract: kill() must cause stdout to end and exited to resolve, so a
+ *  terminated process can never leave the event iterator hanging. */
 export interface SpawnedProcess {
 	readonly stdout: unknown; // ReadableStream<Uint8Array> or AsyncIterable<Uint8Array>
+	readonly stderr?: unknown;
 	readonly exited: Promise<number>;
 	kill(): void;
 }
@@ -44,12 +47,31 @@ function defaultCliEntry(): string {
 }
 
 const defaultSpawn: SpawnFn = (argv, cwd) =>
-	Bun.spawn([...argv], { cwd, stdout: "pipe", stderr: "pipe" });
+	Bun.spawn([...argv], { cwd, stdout: "pipe", stderr: "pipe" }) as unknown as SpawnedProcess;
+
+const STDERR_TAIL_BYTES = 4096;
+
+/** Drain a stderr stream concurrently, retaining only a bounded trailing
+ *  window for diagnostics. Never blocks the caller; resolves on stream end. */
+function drainStderr(stderr: unknown, max = STDERR_TAIL_BYTES): Promise<string> {
+	if (!stderr) return Promise.resolve("");
+	let tail = "";
+	const decoder = new TextDecoder();
+	return (async () => {
+		for await (const chunk of stderr as AsyncIterable<Uint8Array>) {
+			tail += decoder.decode(chunk, { stream: true });
+			if (tail.length > max) tail = tail.slice(-max);
+		}
+		return tail;
+	})().catch(() => tail);
+}
 
 /** Drive cli-ts headlessly in a given worktree; maps its NDJSON stream to RuntimeEvents. */
 export class CliTsRuntime implements AgentRuntimeAdapter {
 	private readonly sessions = new Map<string, SessionSpec>();
 	private readonly procs = new Map<string, SpawnedProcess>();
+	private readonly running = new Set<string>();
+	private readonly dead = new Set<string>();
 	readonly cliEntry: string;
 	private readonly spawn: SpawnFn;
 
@@ -87,21 +109,35 @@ export class CliTsRuntime implements AgentRuntimeAdapter {
 			yield { type: "error", error: `session ${handle.id} has no model selection` };
 			return;
 		}
-		let proc: SpawnedProcess;
-		try {
-			proc = this.spawn(
-				["bun", "run", this.cliEntry, ...CliTsRuntime.buildArgs(spec)],
-				spec.worktreePath,
-			);
-		} catch (e) {
-			yield { type: "error", error: `spawn failed: ${(e as Error).message}` };
+		// Explicit supported behavior: one run per session — sessions are
+		// one-shot in --print mode and a second consumer would split events.
+		if (this.running.has(handle.id)) {
+			yield { type: "error", error: `session ${handle.id} is already running` };
 			return;
 		}
-		this.procs.set(handle.id, proc);
+		this.running.add(handle.id);
 		try {
+			let proc: SpawnedProcess;
+			try {
+				proc = this.spawn(
+					["bun", "run", this.cliEntry, ...CliTsRuntime.buildArgs(spec)],
+					spec.worktreePath,
+				);
+			} catch (e) {
+				yield { type: "error", error: `spawn failed: ${(e as Error).message}` };
+				return;
+			}
+			this.procs.set(handle.id, proc);
+			// terminate() may have raced the spawn: if the session is already
+			// dead or gone, kill immediately rather than start work.
+			if (this.dead.has(handle.id) || !this.sessions.has(handle.id)) {
+				proc.kill();
+			}
+			const stderrTail = drainStderr(proc.stderr);
 			const decoder = new TextDecoder();
 			let buffer = "";
 			for await (const chunk of proc.stdout as AsyncIterable<Uint8Array>) {
+				if (this.dead.has(handle.id)) break; // terminated mid-stream
 				buffer += decoder.decode(chunk, { stream: true });
 				const lines = buffer.split("\n");
 				buffer = lines.pop() ?? "";
@@ -118,21 +154,36 @@ export class CliTsRuntime implements AgentRuntimeAdapter {
 					if (mapped) yield mapped;
 				}
 			}
-			const code = await proc.exited;
-			if (code !== 0) {
-				yield { type: "error", error: `cli-ts exited ${code}` };
+			const [code, tail] = await Promise.all([proc.exited, stderrTail]);
+			if (this.dead.has(handle.id)) {
+				yield { type: "error", error: `session ${handle.id} terminated` };
+			} else if (code !== 0) {
+				yield { type: "error", error: `cli-ts exited ${code}${tail.trim() ? ` — ${tail.trim()}` : ""}` };
 			} else {
 				yield { type: "done" };
 			}
 		} finally {
+			// Every exit path — done, error, spawn failure, termination —
+			// drops the process handle, the session spec and the markers.
 			this.procs.delete(handle.id);
+			this.running.delete(handle.id);
+			this.sessions.delete(handle.id);
+			this.dead.delete(handle.id);
 		}
 	}
 
+	/** Deterministic at any lifecycle point:
+	 *  - before run(): session spec is dropped → run() reports unknown session.
+	 *  - during spawn/run(): process is killed; run()'s dead-check exits promptly.
+	 *  - after completion: registry already clean → no-op. */
 	async terminate(handle: SessionHandle): Promise<void> {
-		this.procs.get(handle.id)?.kill();
-		this.procs.delete(handle.id);
 		this.sessions.delete(handle.id);
+		const proc = this.procs.get(handle.id);
+		if (proc) {
+			this.dead.add(handle.id);
+			proc.kill();
+			await Promise.race([proc.exited, Bun.sleep(2000)]).catch(() => {});
+		}
 	}
 }
 
