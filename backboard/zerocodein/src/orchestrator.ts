@@ -63,23 +63,33 @@ export interface VerificationPolicy {
 	readonly maxArgs?: number;
 }
 
+// Deliberately absent: node, python, python3 and any general-purpose
+// interpreter — `node test.js` is arbitrary script execution, the exact
+// capability this policy exists to remove. Runners (bun test, vitest,
+// pytest…) intentionally execute project test code; that is accepted as
+// user-approved project-code execution, not a claim the command is safe.
+// Generic interpreters get no such pass. If a Node-based verify path is
+// ever needed it must come back as a narrowly-defined runner rule.
 export const DEFAULT_VERIFICATION_POLICY: VerificationPolicy = {
 	executables: {
 		"test": {},
 		"true": {},
-		"bun": { firstArg: ["test"] },
-		"deno": { firstArg: ["test", "check", "lint"] },
+		"bun": {
+			firstArg: ["test"],
+			deniedArgs: ["--preload", "-r", "--import", "--loader", "-e", "--eval", "--print"],
+		},
+		"deno": {
+			firstArg: ["test", "check", "lint"],
+			deniedArgs: ["--eval", "--eval-file", "-e", "--import"],
+		},
 		"vitest": {},
 		"jest": {},
-		"mocha": {},
+		"mocha": { deniedArgs: ["--require", "-r", "--file", "--import"] },
 		"pytest": {},
 		"tsc": {},
 		"eslint": {},
 		"go": { firstArg: ["test", "vet", "build"] },
 		"cargo": { firstArg: ["test", "check", "clippy", "build"] },
-		"node": { deniedArgs: ["-e", "--eval", "-p", "--print", "-i", "--interactive", "--inspect", "--inspect-brk"] },
-		"python": { deniedArgs: ["-c", "-m", "-i"] },
-		"python3": { deniedArgs: ["-c", "-m", "-i"] },
 	},
 	maxCommandLength: 500,
 	maxArgs: 32,

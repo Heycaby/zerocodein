@@ -566,13 +566,33 @@ describe("verification command policy — fail-closed", () => {
 			"python -m pytest",
 			"python -c 'import os'",
 			"python3 -c print(1)",
+			"python test.py",        // generic interpreter = arbitrary script exec
+			"python3 helper.py",
 			"node -e console.log(1)",
 			"node --eval 'x'",
+			"node test.js",          // same hole as python: generic script exec
+			"node server.js",
 			"npx vitest",
 			"pnpm test",
 			"yarn test",
 			"make test",
 			"uv run pytest",
+		]) {
+			const p = parseVerificationCommand(bad);
+			expect("error" in p, `"${bad}" should be rejected`).toBe(true);
+		}
+	});
+
+	it("policy rejects loader/preload escapes on runners", async () => {
+		for (const bad of [
+			"bun test --preload ./evil.ts",
+			"bun test -r ./evil.ts",
+			"bun test --import ./evil.ts",
+			"bun test --loader ./evil",
+			"deno test --eval evil()",
+			"mocha -r ./preload.js",
+			"mocha --require ts-node/register tests/",
+			"mocha --file ./setup.js",
 		]) {
 			const p = parseVerificationCommand(bad);
 			expect("error" in p, `"${bad}" should be rejected`).toBe(true);
@@ -587,7 +607,6 @@ describe("verification command policy — fail-closed", () => {
 			["vitest run --reporter=dot", "vitest"],
 			["pytest tests/ -q", "pytest"],
 			["tsc --noEmit", "tsc"],
-			["node test.js", "node"],
 			["go test ./...", "go"],
 			["cargo test --workspace", "cargo"],
 		] as const) {

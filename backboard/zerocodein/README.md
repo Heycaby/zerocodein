@@ -47,10 +47,13 @@ the registration.
 
 - Agent-supplied `testCommand`s are untrusted input under a **fail-closed
   policy** (`parseVerificationCommand`): per-executable rules require a fixed
-  subcommand (`bun test`, `go test`, `cargo test`) or deny interpreter escapes
-  (`node -e`, `python -c`/`-m`). Script launchers — `npm`/`npx`/`pnpm`/`yarn`,
-  `bun run`, `make`, `uv run` — are not permitted: allowed commands run a
-  named binary with plain args, no project scripts. No shell, metacharacters,
+  subcommand (`bun test`, `go test`, `cargo test`) and deny preload/eval
+  escapes (`bun --preload`/`-r`/`--import`, `mocha -r`/`--require`/`--file`).
+  Script launchers (`npm`/`npx`/`pnpm`/`yarn`, `bun run`, `make`, `uv run`)
+  **and generic interpreters** (`node`, `python`, `python3`) are not
+  permitted — `node test.js` is arbitrary script execution. Runners
+  (`bun test`, `vitest`, `pytest`…) intentionally execute project test code
+  as *user-approved project-code execution*. No shell, metacharacters,
   chaining, redirection, substitution or paths. The user is shown the exact
   executable, arguments and canonical working directory before approval; the
   approval is bound to that exact tuple (`verifyApprovalKey`), so any later
